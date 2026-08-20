@@ -87,15 +87,51 @@ class VisionConfig:
     # 比赛里距离是已知的，界面上直接选。
     AKTIF_MESAFE_M = None
 
+    # Boresight duzeltme yontemi / 光轴补偿方式:
+    #   "offset" = nisangahi lazerin vurdugu yere TASI (tam FOV korunur,
+    #              ama nisangah ekran ortasinda durmaz)
+    #              把十字线移到激光落点（保留全部视场，但十字线不居中）
+    #   "crop"   = goruntuyu lazer noktasi MERKEZ olacak sekilde KIRP
+    #              (nisangah ortada kalir, karsiliginda biraz FOV kaybi:
+    #               yatayda 2*|ox|, dikeyde 2*|oy| piksel)
+    #              裁剪画面让激光点成为中心（十字线居中，代价是损失
+    #               2*|ox| 宽和 2*|oy| 高的视场）
+    BORESIGHT_MODE = "offset"
+
+    @classmethod
+    def get_calibrated_aim_coords(cls, frame_w: int, frame_h: int):
+        """
+        返回在当前分辨率 (frame_w, frame_h) 下激光瞄准点的绝对像素坐标 (aim_x, aim_y)。
+        无论是 Crop 模式还是 Offset 模式，保证大准星与小屏幕裁切中心 100% 绝对对齐。
+        """
+        if cls.BORESIGHT_MODE == "crop":
+            return int(frame_w // 2), int(frame_h // 2)
+        ox, oy = cls.raw_offset(cls.AKTIF_MESAFE_M)
+        aim_x = max(0, min(frame_w - 1, frame_w // 2 + ox))
+        aim_y = max(0, min(frame_h - 1, frame_h // 2 + oy))
+        return int(aim_x), int(aim_y)
+
     @classmethod
     def aim_point(cls, mesafe_m=None):
         """Lazerin GERCEKTEN vuracagi ekran noktasi.
            激光【实际】会打到的屏幕点。云台要把目标驱动到这里，而不是画面正中。"""
+        if cls.BORESIGHT_MODE == "crop":
+            return int(cls.CENTER_X), int(cls.CENTER_Y)
         ox, oy = cls.CENTER_OFFSET_X, cls.CENTER_OFFSET_Y
         if mesafe_m and mesafe_m > 0.2:
             ox += cls.PARALLAX_X_AT_1M / mesafe_m
             oy += cls.PARALLAX_Y_AT_1M / mesafe_m
         return int(round(cls.CENTER_X + ox)), int(round(cls.CENTER_Y + oy))
+
+    @classmethod
+    def raw_offset(cls, mesafe_m=None):
+        """Moddan bagimsiz ham kayma (px). Kirpma bunu kullanir.
+           与模式无关的原始偏移，裁剪用它。"""
+        ox, oy = float(cls.CENTER_OFFSET_X), float(cls.CENTER_OFFSET_Y)
+        if mesafe_m and mesafe_m > 0.2:
+            ox += cls.PARALLAX_X_AT_1M / mesafe_m
+            oy += cls.PARALLAX_Y_AT_1M / mesafe_m
+        return int(round(ox)), int(round(oy))
 
     @classmethod
     def set_center_offset(cls, ox: int, oy: int):
@@ -142,8 +178,7 @@ class VisionConfig:
     @classmethod
     def save_calibration(cls):
         try:
-            cls.save_crosshair_calibration()
-            return True
+            return cls.save_crosshair_calibration()
         except Exception:
             return False
 
@@ -152,37 +187,57 @@ class VisionConfig:
         import json, os
         try:
             if os.path.exists(cls.CALIB_PATH):
-                d = json.load(open(cls.CALIB_PATH, encoding="utf-8"))
+                with open(cls.CALIB_PATH, "r", encoding="utf-8") as f:
+                    d = json.load(f)
                 cls.CENTER_OFFSET_X = int(d.get("offset_x", 0))
                 cls.CENTER_OFFSET_Y = int(d.get("offset_y", 0))
                 cls.PARALLAX_X_AT_1M = float(d.get("parallax_x_at_1m", 0.0))
                 cls.PARALLAX_Y_AT_1M = float(d.get("parallax_y_at_1m", 0.0))
+                cls.BORESIGHT_MODE = str(d.get("boresight_mode", "offset"))
+                rng = d.get("range_m", None)
+                cls.AKTIF_MESAFE_M = float(rng) if rng is not None else None
                 return True
-        except Exception:
+        except Exception as e:
             pass
         return False
 
     @classmethod
     def save_crosshair_calibration(cls):
         import json, os
-        os.makedirs(os.path.dirname(cls.CALIB_PATH) or ".", exist_ok=True)
-        json.dump({
-            "offset_x": cls.CENTER_OFFSET_X,
-            "offset_y": cls.CENTER_OFFSET_Y,
-            "parallax_x_at_1m": cls.PARALLAX_X_AT_1M,
-            "parallax_y_at_1m": cls.PARALLAX_Y_AT_1M,
-            "description": "Laser-camera boresight. aim = center + offset + parallax/distance_m",
-        }, open(cls.CALIB_PATH, "w", encoding="utf-8"), indent=4, ensure_ascii=False)
-        return cls.CALIB_PATH
+        try:
+            os.makedirs(os.path.dirname(cls.CALIB_PATH) or ".", exist_ok=True)
+            payload = {
+                "offset_x": int(cls.CENTER_OFFSET_X),
+                "offset_y": int(cls.CENTER_OFFSET_Y),
+                "parallax_x_at_1m": float(cls.PARALLAX_X_AT_1M),
+                "parallax_y_at_1m": float(cls.PARALLAX_Y_AT_1M),
+                "boresight_mode": str(cls.BORESIGHT_MODE),
+                "range_m": float(cls.AKTIF_MESAFE_M) if cls.AKTIF_MESAFE_M is not None else None,
+                "description": "Laser-camera boresight calibration configuration",
+            }
+            with open(cls.CALIB_PATH, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=4, ensure_ascii=False)
+            return True
+        except Exception:
+            return False
     PIXELS_PER_DEGREE = 20  # 像素到角度转换系数（估算值）
     
     # ==========================
-    # 颜色阈值 - 蓝色物体
+    # 颜色阈值 - 蓝色物体 (基础 HSV 模式)
     # ==========================
     # 蓝色在 100-140 度
     # 提高V下限(30->60)和S下限(100->140)，避免黑色物体和阴影被误判为蓝色
     HSV_BLUE_LOWER = np.array([100, 140, 60])
     HSV_BLUE_UPPER = np.array([140, 255, 255])
+    
+    # ==========================
+    # 敌我识别 (IFF) 光照与多色彩空间自适应参数
+    # ==========================
+    # 走廊/复杂光照自适应参数
+    IFF_LIGHTING_MODE = "AUTO"             # "AUTO", "HALLWAY_WARM", "STANDARD"
+    IFF_MIN_FOREGROUND_RATIO = 0.05        # 目标前景区域中颜色有效像素最低占比 (5%)
+    IFF_DOMINANCE_RATIO = 1.25             # 主导色彩与竞争色彩的比值门限 (1.25x)
+    IFF_MIN_VALID_PIXELS = 6               # 最小有效色彩像素数
     
     # ==========================
     # 形态学参数
@@ -221,4 +276,5 @@ class VisionConfig:
     def get_class_display_name(cls, class_name: str) -> str:
         """Get friendly English display name for class"""
         return cls.CLASS_LABELS_EN.get(class_name, class_name)
+
 

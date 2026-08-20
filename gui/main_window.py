@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QLabel, QMessageBox, QScrollArea, QSplitter
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QCloseEvent, QKeyEvent
 
 from utils.logger import Logger
@@ -37,9 +37,11 @@ try:
     from core.gimbal_controller import GimbalController
     from vision.vision_worker import VisionWorker
     from gui.test_panel import TestModePanel
+    from core.stage3_mission_director import Stage3MissionDirector
     from gui.widgets import (
         CameraView, CameraPanel, SerialPanel, ModePanel,
-        PIDTuner, ControlPanel, MouseControlPanel, DetectionPanel, CrosshairCalibrationPanel
+        PIDTuner, ControlPanel, MouseControlPanel, DetectionPanel, CrosshairCalibrationPanel,
+        Stage3MissionPanel
     )
 except ImportError:
     sys.path.append("..")
@@ -49,9 +51,11 @@ except ImportError:
     from core.gimbal_controller import GimbalController
     from vision.vision_worker import VisionWorker
     from gui.test_panel import TestModePanel
+    from core.stage3_mission_director import Stage3MissionDirector
     from gui.widgets import (
         CameraView, CameraPanel, SerialPanel, ModePanel,
-        PIDTuner, ControlPanel, MouseControlPanel, DetectionPanel, CrosshairCalibrationPanel
+        PIDTuner, ControlPanel, MouseControlPanel, DetectionPanel, CrosshairCalibrationPanel,
+        Stage3MissionPanel
     )
 
 class MainWindow(QMainWindow):
@@ -82,6 +86,8 @@ class MainWindow(QMainWindow):
         self.vision_thread = VisionWorker()
         self.controller = GimbalController(self.serial_thread)
         self.camera_request_generation = -1
+        self.keyboard_control_enabled = True
+        self.current_mode: str = "IDLE"
 
         # [初始化]
         self.init_ui()
@@ -90,7 +96,18 @@ class MainWindow(QMainWindow):
         # 启动视觉线程
         self.vision_thread.start()
         
-        # 摄像头会通过 camera_panel 自动检测并应用，无需手动初始化
+        # 启动时自动尝试连接保存的 STM32 端口
+        QTimer.singleShot(700, self._auto_connect_serial)
+
+    def _auto_connect_serial(self):
+        """自动连接保存的 STM32 串口"""
+        from config.device_config import DeviceConfig
+        if getattr(DeviceConfig, "AUTO_CONNECT_SERIAL", True):
+            port = self.serial_panel.combo_port.currentData()
+            if port and not self.serial_panel.is_connected:
+                logger.info(f"[GUI] Auto-connecting to saved serial port: {port}...")
+                self.serial_panel.btn_connect.setChecked(True)
+                self.serial_panel._on_connect_clicked()
 
     def init_ui(self):
         """初始化界面 - 使用响应式水平分割布局 (QSplitter)"""
@@ -170,12 +187,14 @@ class MainWindow(QMainWindow):
         self.camera_panel = CameraPanel(default_id=cfg.CAMERA_ID)
         right_layout.addWidget(self.camera_panel)
 
-        # 3. 模式选择面板
-        self.mode_panel = ModePanel()
+        # 3. 模式选择面板 (内嵌完整 Stage 3 Workflow 面板)
+        self.stage3_director = Stage3MissionDirector(main_window=self)
+        self.mode_panel = ModePanel(director=self.stage3_director)
+        self.stage3_mission_panel = self.mode_panel.stage3_mission_panel
         right_layout.addWidget(self.mode_panel)
 
         # Yetenek 7: dost/dusman + ates izni paneli
-        # 能力7：敌我识别 + 开火授权面板（只在 YOLO Defense Tracking 下显示）
+        # 能力6/7：目标分类与敌我识别态势表
         self.detection_panel = DetectionPanel()
         self.detection_panel.setVisible(False)
         right_layout.addWidget(self.detection_panel)
@@ -199,10 +218,10 @@ class MainWindow(QMainWindow):
         self.control_panel = ControlPanel()
         right_layout.addWidget(self.control_panel)
 
-        # 6. 测试模式面板（默认隐藏）
+        # 6. 手动电机与键盘控制面板 (常驻主界面，随时可直接操控)
         self.test_panel = TestModePanel()
-        self.test_panel.setVisible(False)
-        self.test_panel.setMaximumHeight(150)  # 限制最大高度
+        self.test_panel.setVisible(True)
+        self.test_panel.setMaximumHeight(160)
         right_layout.addWidget(self.test_panel)
 
         # 7. 鼠标手动瞄准面板（默认隐藏）
@@ -243,6 +262,8 @@ class MainWindow(QMainWindow):
         self.vision_thread.iff_signal.connect(self.on_iff_update)
         self.calibration_panel.offset_changed.connect(self.on_crosshair_offset)
         self.vision_thread.detections_signal.connect(self.detection_panel.update_detections)
+        self.vision_thread.detections_signal.connect(self.stage3_director.on_detections_update)
+        self.vision_thread.laser_fire_request_signal.connect(self.on_laser_fire_request)
         # 物体追踪模式发送目标原始坐标，误差由控制器计算
         self.vision_thread.target_pos_signal.connect(self.controller.handle_target_position)
 
@@ -263,6 +284,10 @@ class MainWindow(QMainWindow):
         
         # ===== 串口线程 =====
         self.serial_thread.connection_state_signal.connect(self.on_connection_status_changed)
+        if hasattr(self.serial_thread, "data_sent_signal"):
+            self.serial_thread.data_sent_signal.connect(self.serial_panel.log_tx)
+        if hasattr(self.serial_thread, "data_received_signal"):
+            self.serial_thread.data_received_signal.connect(self.serial_panel.log_rx)
         
         # ===== 摄像头面板 =====
         self.camera_panel.camera_changed.connect(self.on_camera_changed)
@@ -273,6 +298,14 @@ class MainWindow(QMainWindow):
         # ===== 控制器 =====
         self.controller.status_update_signal.connect(self.update_status)
         self.controller.position_update_signal.connect(self.update_status)
+        self.controller.position_update_signal.connect(self.vision_thread.update_telemetry_pos)
+        self.controller.laser_state_signal.connect(self.vision_thread.update_telemetry_laser)
+        self.controller.speed_gear_changed_signal.connect(
+            lambda gear, mult: self.camera_view.set_speed_gear_visual(gear)
+        )
+        self.controller.speed_gear_changed_signal.connect(
+            lambda gear, mult: self.vision_thread.set_speed_gear(gear)
+        )
         
         # ===== GUI 组件 =====
         # 串口面板
@@ -280,9 +313,12 @@ class MainWindow(QMainWindow):
         
         # 模式面板
         self.mode_panel.mode_changed.connect(self.on_mode_changed)
+        self.mode_panel.mode_changed.connect(self.vision_thread.set_mode)
         self.mode_panel.yolo_model_changed.connect(self.vision_thread.set_yolo_model)
         self.mode_panel.yolo_class_changed.connect(self.vision_thread.set_yolo_target_class)
         self.mode_panel.yolo_conf_changed.connect(self.vision_thread.set_yolo_conf_threshold)
+        self.mode_panel.stage3_start_requested.connect(self.stage3_director.start_mission)
+        self.mode_panel.stage3_abort_requested.connect(lambda: self.stage3_director.abort_mission("User Aborted"))
         
         # PID 调参面板
         self.pid_tuner.pid_changed.connect(self.on_pid_changed)
@@ -307,8 +343,15 @@ class MainWindow(QMainWindow):
             lambda armed, firing, pwr: self.control_panel.set_laser_firing_visual(firing)
         )
         
-        # 摄像头全屏切换
+        # 摄像头全屏、准星画中画缩放、3 档速度与 3 键录屏信号
         self.camera_view.fullscreen_requested.connect(self.toggle_fullscreen_mode)
+        self.camera_view.pip_zoom_changed.connect(self.vision_thread.set_pip_zoom)
+        self.camera_view.speed_gear_changed.connect(self.controller.set_speed_gear)
+        self.camera_view.speed_gear_changed.connect(self.vision_thread.set_speed_gear)
+        self.camera_view.record_start_requested.connect(self.on_start_recording)
+        self.camera_view.record_pause_requested.connect(self.on_pause_recording)
+        self.camera_view.record_stop_requested.connect(self.on_stop_recording)
+        self.vision_thread.recording_status_signal.connect(self.camera_view.set_recording_status)
 
         # 手动测试面板（支持单步微调、长按连续移动、独立键盘开关）
         self.test_panel.request_move_signal.connect(self.on_manual_move)
@@ -401,21 +444,24 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Camera closed")
         else:
             logger.info("[GUI] User triggered open camera")
-            self.camera_view.set_camera_active(False)
             cam_id = self.camera_panel.get_current_camera_id()
             w, h = self.camera_panel.get_selected_resolution()
             self.vision_thread.switch_camera(cam_id, w, h)
     
     def on_mode_changed(self, mode):
         """Switch modes while keeping automatic and manual motion exclusive."""
+        self.current_mode = mode
         logger.info(f"[GUI] Mode switched: {mode}")
 
-        self.detection_panel.setVisible(mode == "YOLO_TRACKING")
-        if mode != "YOLO_TRACKING":
+        is_defense_mode = mode in ("YOLO_TRACKING", "STAGE3_BALLOONS", "STAGE3_BALLOON_DEFENSE")
+        self.detection_panel.setVisible(is_defense_mode)
+        self.stage3_mission_panel.setVisible(is_defense_mode)
+        if not is_defense_mode:
             self.detection_panel.clear_detections()
-        is_test = mode == "TEST"
+            if hasattr(self, "stage3_director") and self.stage3_director.is_running:
+                self.stage3_director.abort_mission("Mode Switched Away")
         is_mouse = mode == "MANUAL_MOUSE"
-        self.test_panel.setVisible(is_test)
+        self.test_panel.setVisible(True) # 手动控制面板始终常驻显示
         self.mouse_control_panel.setVisible(is_mouse)
 
         # Every mode transition first disarms the previous motion source.
@@ -427,11 +473,47 @@ class MainWindow(QMainWindow):
         # Manual modes still display live video but do not run target detection.
         vision_mode = "IDLE" if mode in ("TEST", "MANUAL_MOUSE") else mode
         self.vision_thread.set_mode(vision_mode)
-        self.status_label.setText(
-            "Mouse Aim: Click live view to start, Esc to stop"
-            if is_mouse
-            else f"Mode: {mode}"
-        )
+        
+        if mode == "BALLOON_HUNT":
+            self.control_panel.set_control_enabled(True)
+            self.status_label.setText("🎈 Orange Balloon Pop Mode: Auto-tracking & 100% Laser Active")
+        elif mode in ("STAGE3_BALLOONS", "STAGE3_BALLOON_DEFENSE"):
+            self.control_panel.set_control_enabled(True)
+            self.status_label.setText("🎈 Stage 3 Balloon Defense: 1 Red Hostile + 2 Blue Friendly (Ready)")
+        else:
+            self.controller.set_laser_firing(False)
+            self.status_label.setText(
+                "Mouse Aim: Click live view to start, Esc to stop"
+                if is_mouse
+                else f"Mode: {mode}"
+            )
+    
+    def on_laser_fire_request(self, firing: bool, power: int = 100):
+        """来自视觉线程（如橙色气球打击模式）的自动开火请求"""
+        try:
+            if firing:
+                if not self.controller.laser_armed:
+                    self.controller.set_laser_armed(True)
+                    if hasattr(self.control_panel, 'btn_arm'):
+                        self.control_panel.btn_arm.blockSignals(True)
+                        self.control_panel.btn_arm.setChecked(True)
+                        self.control_panel.btn_arm.setText("⚔️ ARMED (ACTIVE)")
+                        self.control_panel.btn_arm.blockSignals(False)
+                        self.control_panel.btn_fire.setEnabled(True)
+                if self.controller.laser_power != power:
+                    self.controller.set_laser_power(power)
+                    if hasattr(self.control_panel, 'slider_power'):
+                        self.control_panel.slider_power.blockSignals(True)
+                        self.control_panel.slider_power.setValue(power)
+                        self.control_panel.lbl_power_val.setText(f"{power}%")
+                        self.control_panel.slider_power.blockSignals(False)
+                if not self.controller.laser_firing:
+                    self.controller.set_laser_firing(True)
+            else:
+                if self.controller.laser_firing:
+                    self.controller.set_laser_firing(False)
+        except Exception as e:
+            logger.error(f"[MAIN WINDOW] 激光开火请求处理异常: {e}")
     
     def on_crosshair_offset(self, ox: int, oy: int):
         """Boresight offset degisti -> hem cizim hem nisan alma bundan etkilenir."""
@@ -510,6 +592,24 @@ class MainWindow(QMainWindow):
             "Motors stopped. Current position has been set as software relative origin."
         )
     
+    def on_start_recording(self):
+        """开始录屏"""
+        success = self.vision_thread.start_recording()
+        if success:
+            self.status_label.setText("🔴 正在录制全屏超清视频流...")
+            self.status_label.setStyleSheet("color: #ef4444; font-weight: bold; padding: 5px;")
+
+    def on_pause_recording(self):
+        """暂停/继续录屏"""
+        self.vision_thread.pause_recording()
+
+    def on_stop_recording(self):
+        """停止并保存录屏"""
+        saved_file = self.vision_thread.stop_recording()
+        if saved_file:
+            self.status_label.setText(f"✓ 录屏已完成并保存至: {saved_file}")
+            self.status_label.setStyleSheet("color: #38bdf8; font-weight: bold; padding: 5px;")
+
     def on_manual_move(self, axis, direction):
         """手动移动（测试模式）"""
         print(f"[GUI] Received manual move request: axis={axis}, dir={direction}")
@@ -546,7 +646,7 @@ class MainWindow(QMainWindow):
         self.detection_panel.set_emergency_stop_visual()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
-        """全局快捷键：F11 全屏切换、空格键发射激光、Esc 退出全屏/急停、方向键/WASD 手动点动"""
+        """全局快捷键：F11 全屏切换、空格键发射激光、Esc 退出全屏/急停、[ ] / + - 准星画中画缩放、R 录屏、方向键/WASD 手动点动"""
         if event.isAutoRepeat():
             return
 
@@ -580,22 +680,59 @@ class MainWindow(QMainWindow):
                 event.accept()
                 return
 
-        # 键盘方向键 (↑/↓/←/→) 与 (W/S/A/D) 快捷操控云台（仅在勾选开启时生效）
-        if getattr(self, "keyboard_control_enabled", False):
+        # 准星放大镜快捷键：] 或 + 或 = 放大 / [ 或 - 缩小
+        if key in (Qt.Key.Key_BracketRight, Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+            self.camera_view.zoom_in()
+            event.accept()
+            return
+        elif key in (Qt.Key.Key_BracketLeft, Qt.Key.Key_Minus):
+            self.camera_view.zoom_out()
+            event.accept()
+            return
+
+        # 数字键 1, 2, 3: 快速切换电机速度档位 (Gear 1: 0.3x, Gear 2: 1.0x, Gear 3: 2.2x)
+        if key == Qt.Key.Key_1:
+            self.controller.set_speed_gear(1)
+            event.accept()
+            return
+        elif key == Qt.Key.Key_2:
+            self.controller.set_speed_gear(2)
+            event.accept()
+            return
+        elif key == Qt.Key.Key_3:
+            self.controller.set_speed_gear(3)
+            event.accept()
+            return
+
+        # R 键：快捷录屏 (若空闲则开始录制，若正在录制则暂停/继续)
+        if key == Qt.Key.Key_R:
+            if self.vision_thread.recording_state == "IDLE":
+                self.on_start_recording()
+            else:
+                self.on_pause_recording()
+            event.accept()
+            return
+
+        # 键盘方向键 (↑/↓/←/→) 与 (W/S/A/D) 快捷操控云台（长按连续旋转，松开即停）
+        if getattr(self, "keyboard_control_enabled", True):
             if key in (Qt.Key.Key_Up, Qt.Key.Key_W):
-                self.controller.start_manual_continuous('y', 1)
+                if not event.isAutoRepeat():
+                    self.controller.start_manual_continuous('y', 1)
                 event.accept()
                 return
             elif key in (Qt.Key.Key_Down, Qt.Key.Key_S):
-                self.controller.start_manual_continuous('y', -1)
+                if not event.isAutoRepeat():
+                    self.controller.start_manual_continuous('y', -1)
                 event.accept()
                 return
             elif key in (Qt.Key.Key_Left, Qt.Key.Key_A):
-                self.controller.start_manual_continuous('x', -1)
+                if not event.isAutoRepeat():
+                    self.controller.start_manual_continuous('x', -1)
                 event.accept()
                 return
             elif key in (Qt.Key.Key_Right, Qt.Key.Key_D):
-                self.controller.start_manual_continuous('x', 1)
+                if not event.isAutoRepeat():
+                    self.controller.start_manual_continuous('x', 1)
                 event.accept()
                 return
 

@@ -11,7 +11,7 @@
 """
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton, 
     QGroupBox, QSlider, QLabel, QFrame
 )
 from PyQt6.QtCore import pyqtSignal, Qt
@@ -24,7 +24,7 @@ class ControlPanel(QWidget):
     control_toggled = pyqtSignal(bool)       # 自动追踪开关
     reset_requested = pyqtSignal()           # 归中/原点重置
     emergency_stop_requested = pyqtSignal()  # 急停信号
-    
+
     # 激光武器控制信号
     laser_armed_toggled = pyqtSignal(bool)   # 激光保险 (ARM/SAFE)
     laser_fire_changed = pyqtSignal(bool)    # 激光击发 (True=开火, False=停火)
@@ -50,7 +50,7 @@ class ControlPanel(QWidget):
         control_layout = QHBoxLayout(control_group)
         control_layout.setContentsMargins(10, 10, 10, 10)
         control_layout.setSpacing(8)
-        
+
         # 开始/停止追踪按钮
         self.btn_control = QPushButton("▶ Start Tracking")
         self.btn_control.setCheckable(True)

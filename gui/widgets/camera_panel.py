@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import pyqtSignal, QTimer, Qt
 import cv2
 from config.vision_config import VisionConfig
+from config.device_config import DeviceConfig
 
 
 class CameraPanel(QGroupBox):
@@ -31,13 +32,13 @@ class CameraPanel(QGroupBox):
     flip_changed = pyqtSignal(str)              # 画面翻转信号 ("NONE", "180", "V", "H")
     open_settings_requested = pyqtSignal()      # 请求打开 DirectShow 相机硬件属性面板
 
-    def __init__(self, default_id=0, parent=None):
+    def __init__(self, default_id=None, parent=None):
         super().__init__("Camera Settings", parent)
         self.available_cameras = []
         self.is_camera_open = False
-        self.init_ui(default_id)
+        self.init_ui(default_id if default_id is not None else DeviceConfig.CAMERA_ID)
         # 延迟检测，不阻塞 UI 启动
-        QTimer.singleShot(500, self.detect_cameras)
+        QTimer.singleShot(400, self.detect_cameras)
     
     def init_ui(self, default_id):
         """初始化UI"""
@@ -56,7 +57,11 @@ class CameraPanel(QGroupBox):
             "1280x720 (60 FPS - HD)",
             "1920x1080 (60 FPS - Full HD)"
         ])
-        self.combo_resolution.setCurrentIndex(0)  # 默认 640x480
+        saved_res_prefix = f"{DeviceConfig.RESOLUTION_WIDTH}x{DeviceConfig.RESOLUTION_HEIGHT}"
+        for i in range(self.combo_resolution.count()):
+            if self.combo_resolution.itemText(i).startswith(saved_res_prefix):
+                self.combo_resolution.setCurrentIndex(i)
+                break
         self.combo_resolution.setToolTip("Select resolution (640x480 lowest latency)")
         
         # 3. 画面方向/翻转选择 (即时热切换)
@@ -65,7 +70,7 @@ class CameraPanel(QGroupBox):
         self.combo_flip.addItem("180° Flip (Inverted)", "180")
         self.combo_flip.addItem("Vertical Flip", "V")
         self.combo_flip.addItem("Horizontal Mirror", "H")
-        initial_flip_idx = self.combo_flip.findData(getattr(VisionConfig, "FLIP_MODE", "NONE"))
+        initial_flip_idx = self.combo_flip.findData(getattr(DeviceConfig, "FLIP_MODE", "NONE"))
         if initial_flip_idx >= 0:
             self.combo_flip.setCurrentIndex(initial_flip_idx)
         self.combo_flip.currentIndexChanged.connect(self._on_flip_changed)
@@ -136,41 +141,32 @@ class CameraPanel(QGroupBox):
         QTimer.singleShot(100, self._detect_cameras_task)
     
     def _detect_cameras_task(self):
-        """实际检测任务 - 智能快速版"""
-        self.available_cameras = []
+        """实际检测任务 - 快速直连版 (避免启动时占用硬件设备导致 DirectShow 锁死)"""
+        # 预置可用设备列表 (Camera 0: 笔记本自带, Camera 1: USB云台相机, Camera 2: 备用)
+        self.available_cameras = [0, 1, 2]
         self.combo_camera.clear()
+        self.combo_camera.addItem("Camera 0 (Integrated Webcam)")
+        self.combo_camera.addItem("Camera 1 (USB Gimbal Camera)")
+        self.combo_camera.addItem("Camera 2 (Aux USB Camera)")
         
-        # 先检测 Camera 0
-        if self._try_open_camera(0):
-            # 成功，检查是否还有 Camera 1（笔记本+USB场景）
-            self._try_open_camera(1)
-            # 如果有两个了，大概率不会有更多，跳过 Camera 2
-        else:
-            # Camera 0 失败，尝试 Camera 1（可能只插了USB摄像头）
-            if self._try_open_camera(1):
-                # 找到了，停止检测
-                pass
-            else:
-                # 都没有，再试试 Camera 2
-                self._try_open_camera(2)
+        saved_id = DeviceConfig.CAMERA_ID if DeviceConfig.CAMERA_ID in self.available_cameras else 1
+        saved_idx = self.available_cameras.index(saved_id)
+        self.combo_camera.setCurrentIndex(saved_idx)
         
-        # 更新状态并智能应用
-        if self.available_cameras:
-            num_cameras = len(self.available_cameras)
-            if num_cameras == 1:
-                # 只有一cameras，自动选择
-                self.combo_camera.setCurrentIndex(0)
-                msg = f"✓ Detected Camera {self.available_cameras[0]}"
-            else:
-                msg = f"✓ Detected {num_cameras} cameras"
-            
-            self.lbl_status.setText(msg)
-            self.lbl_status.setStyleSheet("color: green; font-size: 10px;")
-        else:
-            msg = "No cameras detected! Check connection"
-            self.lbl_status.setText(msg)
-            self.lbl_status.setStyleSheet("color: red; font-size: 10px;")
+        self.lbl_status.setText(f"✓ Ready: Camera {saved_id}")
+        self.lbl_status.setStyleSheet("color: green; font-size: 10px;")
+
+        if DeviceConfig.AUTO_OPEN_CAMERA and not self.is_camera_open:
+            QTimer.singleShot(100, self._auto_start_camera)
     
+    def _auto_start_camera(self):
+        """启动时平稳自动开启保存的摄像头"""
+        if not self.is_camera_open and self.available_cameras:
+            self.is_camera_open = True
+            self.btn_toggle.setText("Close Camera")
+            self.btn_toggle.setStyleSheet("background-color: #dc3545; color: white;")
+            self._on_apply_clicked()
+
     def _on_toggle_clicked(self):
         """开启或关闭摄像头"""
         if not self.available_cameras:
@@ -183,8 +179,7 @@ class CameraPanel(QGroupBox):
         if self.is_camera_open:
             self.btn_toggle.setText("Close Camera")
             self.btn_toggle.setStyleSheet("background-color: #dc3545; color: white;")
-            self.camera_toggled.emit(True)
-            self._on_apply_clicked()  # 触发发送 camera_changed
+            self._on_apply_clicked()  # 触发发送唯一的 camera_changed 信号
         else:
             self.btn_toggle.setText("Open Camera")
             self.btn_toggle.setStyleSheet("background-color: #007bff; color: white;")
@@ -196,6 +191,8 @@ class CameraPanel(QGroupBox):
         """画面翻转下拉框选择改变"""
         mode = self.combo_flip.currentData()
         if mode:
+            DeviceConfig.FLIP_MODE = mode
+            DeviceConfig.save()
             self.flip_changed.emit(mode)
 
     def _on_settings_clicked(self):
@@ -267,6 +264,13 @@ class CameraPanel(QGroupBox):
         fps_part = f"@{old_text.split('@')[1]}" if "@" in old_text else ")"
         self.combo_camera.setItemText(camera_index, f"Camera {camera_id} ({width}x{height}{fps_part}")
         
+        # 持久化保存设备配置
+        DeviceConfig.CAMERA_ID = camera_id
+        DeviceConfig.RESOLUTION_WIDTH = width
+        DeviceConfig.RESOLUTION_HEIGHT = height
+        DeviceConfig.FLIP_MODE = self.combo_flip.currentData() or "NONE"
+        DeviceConfig.save()
+
         self.lbl_status.setText(f"✓ Switched to Camera {camera_id} ({width}x{height})")
         self.lbl_status.setStyleSheet("color: green; font-size: 10px;")
     

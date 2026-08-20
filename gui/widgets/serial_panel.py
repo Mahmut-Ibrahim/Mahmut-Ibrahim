@@ -8,11 +8,14 @@
 - 紧凑美观的响应式 UI 布局，无任何文字截断
 """
 
+from datetime import datetime
+from collections import deque
 from PyQt6.QtWidgets import (
-    QGroupBox, QVBoxLayout, QHBoxLayout, QComboBox, QPushButton, QLabel, QFrame
+    QGroupBox, QVBoxLayout, QHBoxLayout, QComboBox, QPushButton, QLabel, QFrame, QPlainTextEdit
 )
-from PyQt6.QtCore import pyqtSignal, Qt
+from PyQt6.QtCore import pyqtSignal, Qt, QTimer
 import serial.tools.list_ports
+from config.device_config import DeviceConfig
 
 
 class SerialPanel(QGroupBox):
@@ -24,7 +27,7 @@ class SerialPanel(QGroupBox):
     def __init__(self, default_port=None, parent=None):
         super().__init__("USB Communication", parent)
         self.is_connected = False
-        self.init_ui(default_port)
+        self.init_ui(default_port or DeviceConfig.SERIAL_PORT)
     
     def init_ui(self, default_port):
         """初始化UI"""
@@ -44,7 +47,7 @@ class SerialPanel(QGroupBox):
                 super().showPopup()
 
             def refresh_ports(sub_self):
-                current_selected = sub_self.currentData()
+                current_selected = sub_self.currentData() or DeviceConfig.SERIAL_PORT
                 sub_self.clear()
                 all_ports = list(serial.tools.list_ports.comports())
                 
@@ -60,6 +63,7 @@ class SerialPanel(QGroupBox):
                     return
 
                 usb_found_index = -1
+                saved_port_index = -1
                 for idx, p in enumerate(valid_ports):
                     is_stm32_usb = (p.vid == 0x0483 and p.pid == 0x5740) or ("STMicroelectronics" in str(p.description)) or ("0483:5740" in str(p.hwid))
                     
@@ -72,8 +76,12 @@ class SerialPanel(QGroupBox):
                         label = f"{p.device} ({clean_desc[:16]})"
                     
                     sub_self.addItem(label, p.device)
+                    if p.device == DeviceConfig.SERIAL_PORT:
+                        saved_port_index = idx
                 
-                if current_selected is not None:
+                if saved_port_index >= 0:
+                    sub_self.setCurrentIndex(saved_port_index)
+                elif current_selected is not None:
                     found_idx = sub_self.findData(current_selected)
                     if found_idx >= 0:
                         sub_self.setCurrentIndex(found_idx)
@@ -153,7 +161,73 @@ class SerialPanel(QGroupBox):
         """)
         self.btn_connect.clicked.connect(self._on_connect_clicked)
         main_layout.addWidget(self.btn_connect)
+
+        # 4. STM32 实时通信监视器 (TX / RX Serial Console)
+        monitor_header = QHBoxLayout()
+        lbl_mon = QLabel("<b>📡 Live Port Monitor (TX / RX)</b>")
+        lbl_mon.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        monitor_header.addWidget(lbl_mon)
+        monitor_header.addStretch()
+
+        self.btn_clear_log = QPushButton("Clear")
+        self.btn_clear_log.setFixedSize(45, 20)
+        self.btn_clear_log.setStyleSheet("""
+            QPushButton { background-color: #1e293b; color: #94a3b8; border: 1px solid #334155; border-radius: 3px; font-size: 10px; }
+            QPushButton:hover { background-color: #334155; color: #f1f5f9; }
+        """)
+        self.btn_clear_log.clicked.connect(self._clear_monitor)
+        monitor_header.addWidget(self.btn_clear_log)
+        main_layout.addLayout(monitor_header)
+
+        self.txt_monitor = QPlainTextEdit()
+        self.txt_monitor.setReadOnly(True)
+        self.txt_monitor.setMaximumBlockCount(150)
+        self.txt_monitor.setMinimumHeight(100)
+        self.txt_monitor.setMaximumHeight(140)
+        self.txt_monitor.setStyleSheet("""
+            QPlainTextEdit {
+                background-color: #090d16;
+                color: #38bdf8;
+                font-family: Consolas, 'Courier New', monospace;
+                font-size: 10px;
+                border: 1px solid #1e293b;
+                border-radius: 4px;
+                padding: 4px;
+            }
+        """)
+        main_layout.addWidget(self.txt_monitor)
+        
+        # 批量日志刷新定时器 (10Hz)，避免高频运动时 QTextDocument 跨线程崩溃
+        self._log_queue = deque(maxlen=200)
+        self._flush_timer = QTimer(self)
+        self._flush_timer.timeout.connect(self._flush_logs)
+        self._flush_timer.start(100)
     
+    def _clear_monitor(self):
+        self._log_queue.clear()
+        self.txt_monitor.clear()
+
+    def log_tx(self, msg: str):
+        """记录发送给 STM32 的数据 (TX ➜)"""
+        now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        self._log_queue.append(f"[{now}] ⬆ TX ➜ {msg}")
+
+    def log_rx(self, msg: str):
+        """记录从 STM32 接收到的数据 (RX ⬅)"""
+        now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        self._log_queue.append(f"[{now}] ⬇ RX ⬅ {msg}")
+
+    def _flush_logs(self):
+        if not self._log_queue:
+            return
+        lines = []
+        while self._log_queue:
+            lines.append(self._log_queue.popleft())
+        if lines:
+            text = "\n".join(lines)
+            self.txt_monitor.appendPlainText(text)
+            self.txt_monitor.ensureCursorVisible()
+
     def _update_channel_badge(self):
         """更新当前选中端口的通道类型徽章"""
         if self.is_connected:
@@ -188,7 +262,7 @@ class SerialPanel(QGroupBox):
         self.connection_toggled.emit(checked, port)
     
     def set_connection_status(self, success, message):
-        """设置连接状态回调"""
+        """设置连接状态回调并持久化端口"""
         self.is_connected = success
         if success:
             self.btn_connect.setChecked(True)
@@ -196,6 +270,9 @@ class SerialPanel(QGroupBox):
             port_name = self.combo_port.currentData() or ""
             self.lbl_channel_type.setText(f"✓ Connected {port_name} (12 Mbps Full Speed)")
             self.lbl_channel_type.setStyleSheet("color: #22c55e; font-weight: bold; font-size: 12px;")
+            if port_name:
+                DeviceConfig.SERIAL_PORT = port_name
+                DeviceConfig.save()
         else:
             self.btn_connect.setChecked(False)
             self.btn_connect.setText("⚡ Connect")
